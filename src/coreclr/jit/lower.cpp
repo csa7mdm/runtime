@@ -8597,11 +8597,8 @@ void Lowering::LowerShift(GenTreeOp* shift)
             ssize_t  c1            = op1->gtGetOp2()->AsIntCon()->IconValue();
             unsigned innerBitWidth = genTypeSize(op1->TypeGet()) * 8;
 
-            // Only optimize if types match (simplifies width checks)
-            if (op1->TypeGet() == shift->TypeGet())
-            {
-                // We use a larger type to check for overflow (though shift counts likely small)
-                // But conceptually c1+c2 can be large.
+            // We use a larger type to check for overflow (though shift counts likely small)
+            // But conceptually c1+c2 can be large.
                 ssize_t combined = c1 + c2;
 
                 if ((c1 > 0) && (c2 > 0))
@@ -8673,8 +8670,11 @@ void Lowering::LowerShift(GenTreeOp* shift)
             }
         }
         // Case 2: (shift (cast (shift x c1)) c2)
-        // Optimization for: RSZ(CAST(RSZ(x, c1)), c2) -> CAST(RSZ(x, c1 + c2))
-        else if (shift->OperIs(GT_RSZ) && op1->OperIs(GT_CAST) && !op1->gtOverflow() && !op1->IsMultiRegNode())
+        // Optimization for:
+        //   RSZ(CAST(RSZ(x, c1)), c2) -> CAST(RSZ(x, c1 + c2))
+        //   RSH(CAST(RSH(x, c1)), c2) -> CAST(RSH(x, c1 + c2))
+        else if ((shift->OperIs(GT_RSZ) || shift->OperIs(GT_RSH)) && op1->OperIs(GT_CAST) && !op1->gtOverflow() &&
+                 !op1->IsMultiRegNode())
         {
             GenTree* cast       = op1;
             GenTree* innerShift = cast->gtGetOp1();
@@ -8691,15 +8691,17 @@ void Lowering::LowerShift(GenTreeOp* shift)
             // Safest is to disable for narrowing.
             bool isNarrowing = genTypeSize(cast->TypeGet()) < genTypeSize(innerShift->TypeGet());
 
-            if (!isNarrowing && innerShift->OperIs(GT_RSZ) && innerShift->gtGetOp2()->IsCnsIntOrI() && !innerShift->IsMultiRegNode())
+            if (!isNarrowing && innerShift->OperIs(shift->OperGet()) && innerShift->gtGetOp2()->IsCnsIntOrI() &&
+                !innerShift->IsMultiRegNode())
             {
                 ssize_t  c1            = innerShift->gtGetOp2()->AsIntCon()->IconValue();
                 unsigned innerBitWidth = genTypeSize(innerShift->TypeGet()) * 8;
 
                 if ((c1 > 0) && (c2 > 0) && ((c1 + c2) < (ssize_t)innerBitWidth))
                 {
-                    JITDUMP("Optimizing distinct type shifts: (cast (x >> %d)) >> %d -> cast (x >> %d)\n", (int)c1,
-                            (int)c2, (int)(c1 + c2));
+                    JITDUMP("Optimizing distinct type shifts: (cast (x %s %d)) %s %d -> cast (x %s %d)\n",
+                            GenTree::OpName(innerShift->OperGet()), (int)c1, GenTree::OpName(shift->OperGet()), (int)c2,
+                            GenTree::OpName(innerShift->OperGet()), (int)(c1 + c2));
 
                     innerShift->gtGetOp2()->AsIntCon()->SetIconValue(c1 + c2);
 
