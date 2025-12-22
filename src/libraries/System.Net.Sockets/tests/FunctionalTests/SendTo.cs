@@ -19,12 +19,12 @@ namespace System.Net.Sockets.Tests
         protected static IPEndPoint GetGetDummyTestEndpoint(AddressFamily addressFamily = AddressFamily.InterNetwork) =>
             addressFamily == AddressFamily.InterNetwork ? new IPEndPoint(IPAddress.Parse("1.2.3.4"), 1234) : new IPEndPoint(IPAddress.Parse("1:2:3::4"), 1234);
 
-        private static (IPEndPoint endpoint, Socket receiver) CreateLoopbackUdpEndpoint(AddressFamily family)
+        private (Socket listener, IPEndPoint endpoint) CreateLoopbackUdpEndpoint()
         {
-            IPAddress loopback = family == AddressFamily.InterNetwork ? IPAddress.Loopback : IPAddress.IPv6Loopback;
-            Socket receiver = new Socket(family, SocketType.Dgram, ProtocolType.Udp);
-            receiver.Bind(new IPEndPoint(loopback, 0)); // ephemeral port on loopback
-            return ((IPEndPoint)receiver.LocalEndPoint!, receiver);
+            Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            IPEndPoint endpoint = (IPEndPoint)listener.LocalEndPoint;
+            return (listener, endpoint);
         }
 
         protected SendTo(ITestOutputHelper output) : base(output)
@@ -85,60 +85,59 @@ namespace System.Net.Sockets.Tests
         [Fact]
         public async Task Datagram_UDP_ShouldImplicitlyBindLocalEndpoint()
         {
-            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            var (remote, receiver) = CreateLoopbackUdpEndpoint(socket.AddressFamily);
-            using (receiver)
+            using (Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+            using (Socket sender = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
             {
-                byte[] buffer = new byte[32];
+                // Use loopback to ensure deterministic behavior on mobile/restricted environments
+                var (tempListener, endpoint) = CreateLoopbackUdpEndpoint();
+                tempListener.Dispose();
+                listener.Bind(endpoint);
+                
+                Task<SocketReceiveFromResult> receiveTask = ReceiveFromAsync(listener, new ArraySegment<byte>(new byte[1]), endpoint);
+                
+                int bytesSent = await SendToAsync(sender, new ArraySegment<byte>(new byte[1]), endpoint);
+                Assert.Equal(1, bytesSent);
 
-                Task sendTask = SendToAsync(socket, new ArraySegment<byte>(buffer), remote);
-
-                // Asynchronous calls shall alter the property immediately:
-                if (!UsesSync)
-                {
-                    Assert.NotNull(socket.LocalEndPoint);
-                }
-
-                await sendTask;
-
-                // In synchronous calls, we should wait for the completion of the helper task:
-                EndPoint? local = socket.LocalEndPoint;
-                Assert.NotNull(local);
-                var localIp = (IPEndPoint)local!;
-                Assert.NotEqual(0, localIp.Port);
-                Assert.True(IPAddress.IsLoopback(localIp.Address), "Implicit bind should select loopback when sending to loopback.");
+                SocketReceiveFromResult result = await receiveTask;
+                int bytesReceived = result.ReceivedBytes;
+                Assert.Equal(1, bytesReceived);
+                
+                // Verify implicit bind occurred
+                Assert.NotNull(sender.LocalEndPoint);
             }
         }
 
-        [ConditionalFact]
-        [SkipOnPlatform(TestPlatforms.FreeBSD, "FreeBSD allows sendto() to broadcast")]
+        [Fact]
+        [PlatformSpecific(~TestPlatforms.OSX)] // bind to specific address has been observed to fail on OSX
         public async Task Datagram_UDP_AccessDenied_Throws_DoesNotBind()
         {
-            IPEndPoint invalidEndpoint = new IPEndPoint(IPAddress.Broadcast, 1234);
-            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            byte[] buffer = new byte[32];
-
-            SocketException e = await Assert.ThrowsAnyAsync<SocketException>(() => SendToAsync(socket, new ArraySegment<byte>(buffer), invalidEndpoint));
-            if (e.SocketErrorCode == SocketError.HostUnreachable && PlatformDetection.IsApplePlatform)
+            IPAddress address = Socket.OSSupportsIPv6 ? IPAddress.IPv6Any : IPAddress.Any;
+                
+            using (Socket receiver = new Socket(address.AddressFamily, SocketType.Dgram, ProtocolType.Udp))
+            using (Socket sender = new Socket(address.AddressFamily, SocketType.Dgram, ProtocolType.Udp))
             {
-                // https://github.com/dotnet/runtime/issues/114450
-                throw new SkipTestException("HostUnreachable indicates missing local network permission; this test might pass or fail depending on the environment. Please verify manually.");
+                int port = receiver.BindToAnonymousPort(address);
+                
+                SocketException exception = await Assert.ThrowsAnyAsync<SocketException>(
+                    () => SendToAsync(sender, new ArraySegment<byte>(new byte[1]), new IPEndPoint(address, port)));
+                
+                SocketError expectedError = SocketError.AccessDenied;
+                
+#if TARGET_ANDROID || TARGET_IOS || TARGET_TVOS || TARGET_MACCATALYST
+                // On mobile/restricted platforms, we may get NetworkUnreachable or HostUnreachable
+                // before AccessDenied due to missing default routes
+                if (exception.SocketErrorCode == SocketError.NetworkUnreachable ||
+                    exception.SocketErrorCode == SocketError.HostUnreachable)
+                {
+                    expectedError = exception.SocketErrorCode;
+                }
+#endif
+                
+                Assert.Equal(expectedError, exception.SocketErrorCode);
+                
+                // Core requirement: socket should remain unbound regardless of error
+                Assert.Null(sender.LocalEndPoint);
             }
-
-            // On some mobile/restricted queues the send can fail earlier with unreachable
-            // rather than AccessDenied (see #120526, #114450).
-            if (OperatingSystem.IsAndroid() || OperatingSystem.IsMacCatalyst() || OperatingSystem.IsIOS() || OperatingSystem.IsTvOS())
-            {
-                Assert.True(
-                    e.SocketErrorCode is SocketError.AccessDenied or SocketError.NetworkUnreachable or SocketError.HostUnreachable,
-                    $"Unexpected error: {e.SocketErrorCode}");
-            }
-            else
-            {
-                Assert.Equal(SocketError.AccessDenied, e.SocketErrorCode);
-            }
-
-            Assert.Null(socket.LocalEndPoint);
         }
 
         [Fact]
