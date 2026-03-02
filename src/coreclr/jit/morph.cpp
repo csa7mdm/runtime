@@ -11301,6 +11301,40 @@ GenTree* Compiler::fgMorphSmpOpOptional(GenTreeOp* tree, bool* optAssertionPropD
 
             break;
 
+        case GT_RSH:
+        case GT_RSZ:
+
+            // Fold consecutive same-operation shifts with constant amounts:
+            //   (x shift c1) shift c2 -> x shift (c1 + c2)
+            // This optimizes chained divisions that lower to consecutive right shifts (issue #74020).
+
+            if (op2->IsCnsIntOrI() && op1->OperIs(oper) && op1->gtGetOp2()->IsCnsIntOrI() && !op1->IsMultiRegNode())
+            {
+                ssize_t  c1       = op1->gtGetOp2()->AsIntCon()->IconValue();
+                ssize_t  c2       = op2->AsIntCon()->IconValue();
+                unsigned bitWidth = genTypeSize(tree->TypeGet()) * 8;
+
+                if ((c1 > 0) && (c2 > 0) && (bitWidth > 0))
+                {
+                    ssize_t combined = c1 + c2;
+
+                    if (combined < (ssize_t)bitWidth)
+                    {
+                        // Safe to combine: x shift (c1 + c2)
+                        JITDUMP("Folding consecutive shifts: (x shift %d) shift %d -> x shift %d\n",
+                                (int)c1, (int)c2, (int)combined);
+
+                        op2->BashToConst(static_cast<int32_t>(combined));
+                        fgUpdateConstTreeValueNumber(op2);
+                        tree->AsOp()->gtOp1 = op1->gtGetOp1();
+                        DEBUG_DESTROY_NODE(op1->gtGetOp2());
+                        DEBUG_DESTROY_NODE(op1);
+                        return tree;
+                    }
+                }
+            }
+            break;
+
         case GT_INIT_VAL:
             // Initialization values for initBlk have special semantics - their lower
             // byte is used to fill the struct. However, we allow 0 as a "bare" value,
@@ -15974,3 +16008,4 @@ PhaseStatus Compiler::fgMorphArrayOps()
 
     return changed ? PhaseStatus::MODIFIED_EVERYTHING : PhaseStatus::MODIFIED_NOTHING;
 }
+
